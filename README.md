@@ -2,14 +2,14 @@
 
 **A palm-sized, battery-powered smart knob for Home Assistant.**
 
-Rotate to dim the lights, click to toggle relays, wake the PC over LAN — all from a knurled aluminum knob with a round touchscreen that lives on a magnetic wall dock and runs for weeks on a single charge.
+Rotate to dim the lights, click to toggle relays, wake the PC over LAN — all from a knurled aluminum knob with a round touchscreen, housed in a 3D-printed case, that runs for weeks on a single charge.
 
 Built on an **ESP32-S3** with **ESPHome** and **LVGL**. No custom app, no cloud: it talks to Home Assistant over the native API.
 
 <p align="center">
   <img src="docs/images/demo.gif" width="260" alt="Knobby demo: navigating the menu and dimming a light" />
   &nbsp;&nbsp;
-  <img src="docs/images/hero.jpg" width="260" alt="Knobby on its wall dock" />
+  <img src="docs/images/hero.jpg" width="260" alt="Knobby" />
 </p>
 
 ## Features
@@ -17,7 +17,8 @@ Built on an **ESP32-S3** with **ESPHome** and **LVGL**. No custom app, no cloud:
 - **Rotary + touch UI** on a 1.28″ round LCD (GC9A01A, 240×240) — rotate to navigate and adjust, click to select, double-click to go back, touch to wake
 - **Live light dimming** with a circular brightness arc that tracks the ring in real time
 - **Relay control** (3D printer, camera, PC power) and **Wake-on-LAN** with live online/offline status
-- **Fully wireless**: 1000 mAh LiPo, USB-C charging, plus a 4-pin pogo dock that charges it on the wall
+- **Fully wireless**: 1000 mAh LiPo with USB-C charging — no base station, no cables
+- **3D-printed case**: two-part shell held together by M3 screws — STEP model included in [`hardware/`](hardware/)
 - **Two-stage power saving**: backlight off after 30 s, true deep sleep after 60 s (~10 µA on the ESP32 — weeks of standby, not hours); a screen tap wakes it back up
 - **Snappy under load**: coalesced rendering, throttled API pushes and echo-guarded state sync keep the ring lag-free (details below)
 
@@ -44,33 +45,26 @@ Main menu ──► Lights ──► Desk / Camera / Bed ──► detail: arc +
 | TP4056 USB-C module (1 A, with protection) | LiPo charging + battery protection |
 | LiPo 1000 mAh | Battery |
 | MT3608 boost converter, tuned to 5 V | Battery → 5 V rail for the knob |
-| 1N5817 Schottky diode | Dock input protection |
-| 4-pin pogo connector (VBUS + D+/D−) | Wall-dock charging + USB data pass-through |
-| 3D-printed enclosure + wall dock | Body |
+| 3D-printed case, M3 screws ([STEP model](hardware/knobby-case.step)) | Body |
 
 ### Power architecture
 
-The original wiring schema was designed in [Figma](https://www.figma.com/board/tWYULR0jQmhHcf52yjzOwT/Crow-Panel-Schema); this is the equivalent diagram:
-
 ```mermaid
 flowchart LR
-    subgraph dock["Wall dock"]
-        POGO["4-pin pogo connector<br/>VBUS + D+ / D−"]
-    end
-    subgraph knobby["Knobby"]
-        DIODE["1N5817<br/>Schottky"]
-        TP["TP4056 USB-C<br/>1 A charger + protection"]
-        BAT["LiPo<br/>1000 mAh"]
-        BOOST["MT3608 boost<br/>tuned to 5 V"]
-        ESP["ESP32-S3 knob<br/>5 V in via FPC breakout"]
-    end
-    POGO -->|VBUS| DIODE --> TP
-    TP <--> BAT
-    TP -->|OUT+| BOOST -->|5 V| ESP
-    POGO -.->|"D+ / D− (USB data)"| ESP
+    USB["USB-C"] --> TP["TP4056<br/>1 A charger + protection"]
+    TP <--> BAT["LiPo<br/>1000 mAh"]
+    TP -->|OUT+| BOOST["MT3608 boost<br/>tuned to 5 V"] -->|5 V| ESP["ESP32-S3 knob<br/>5 V in via FPC breakout"]
 ```
 
-The TP4056's own USB-C port still works for charging off the dock. In deep sleep the ESP32 drops to ~10 µA; what remains is mostly the MT3608's quiescent draw (~1–2 mA total).
+In deep sleep the ESP32 drops to ~10 µA; what remains is mostly the MT3608's quiescent draw (~1–2 mA total).
+
+### Case
+
+<p align="center">
+  <img src="docs/images/case-render.jpg" width="700" alt="Two-part 3D-printed case: front bezel and vented back shell" />
+</p>
+
+A two-part shell modeled in FreeCAD — front bezel for the knob module and a vented back cover — closed with M3 screws. The printable model is in [`hardware/knobby-case.step`](hardware/knobby-case.step).
 
 ## Firmware highlights
 
@@ -97,6 +91,7 @@ The whole device is a single, heavily commented ESPHome config — [`knobby.yaml
 2. Copy `secrets.example.yaml` to `secrets.yaml` and fill in your Wi-Fi credentials and keys.
 3. Adjust the Home Assistant entity IDs in `knobby.yaml` (lights, switches, WOL button, ping sensor) to match your setup, and check the `manual_ip` block against your network (or remove it if mDNS works for you).
 4. Flash: `esphome run knobby.yaml` (first flash over USB, then OTA).
+5. Print the case from [`hardware/knobby-case.step`](hardware/knobby-case.step) and assemble it with M3 screws.
 
 > The ESPHome node is named `portable-knob` — Knobby's original working title — so it appears in Home Assistant as "Portable Knob". Rename the substitutions at the top of the YAML if you prefer.
 
