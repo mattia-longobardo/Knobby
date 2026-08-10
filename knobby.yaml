@@ -1,0 +1,1390 @@
+substitutions:
+  device_name: portable-knob
+  friendly_name: Portable Knob
+  # Scatti di ghiera necessari per produrre 1 evento effettivo (sensibilita').
+  # Con "resolution: 1" sull'encoder 1 scatto fisico = 1 conteggio, quindi
+  # divisor 1 = 1 evento per scatto. Se la tua ghiera fa 2 conteggi per
+  # scatto (encoder mezzo-passo) metti '2'.
+  rot_divisor: '1'
+  # Passo di luminosita' per evento effettivo, in percento.
+  bri_step: '5'
+  # Per quanto tempo dopo una modifica locale ignorare l'eco di stato da HA.
+  # Serve piu' lungo del tempo di transizione della luce in HA, altrimenti
+  # i valori intermedi della dissolvenza fanno rimbalzare l'arco.
+  ha_echo_guard_ms: '2500'
+  # Ogni quanto, al massimo, spingere la luminosita' verso HA mentre si gira.
+  bri_push_ms: '250'
+  # Nudge del cerchio di luminosita' in pixel, se il vetro tondo del pannello
+  # non e' perfettamente allineato al raster 240x240 (es. '-2' / '3').
+  arc_dx: '0'
+  arc_dy: '0'
+  # Dopo quanto tempo di inattivita' spegnere il backlight (standby leggero).
+  standby_ms: '30000'
+  # Dopo quanto tempo di inattivita' entrare in DEEP SLEEP vero (~1-2mA invece
+  # di ~200mA dalla batteria). Risveglio: TOCCO dello schermo (GPIO5 e' l'unico
+  # wake pin possibile: sull'S3 solo i GPIO 0-21 svegliano dal deep sleep,
+  # quindi encoder e pulsante (41/42/45) NON possono farlo).
+  # Al risveglio il dispositivo riavvia e riconnette WiFi+HA: ~3-5 secondi.
+  deepsleep_ms: '60000'
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    # Priority 800 = prima dell'init dei componenti: gli hold dei GPIO
+    # messi da enter_deep_sleep vanno rilasciati SUBITO, altrimenti
+    # display/touch/switch si inizializzano con i pin ancora congelati.
+    priority: 800
+    then:
+      - lambda: |-
+          gpio_deep_sleep_hold_dis();
+          gpio_hold_dis(GPIO_NUM_1);
+          gpio_hold_dis(GPIO_NUM_2);
+          gpio_hold_dis(GPIO_NUM_13);
+          gpio_hold_dis(GPIO_NUM_40);
+          gpio_hold_dis(GPIO_NUM_46);
+      - delay: 800ms
+      - script.execute: refresh_ui
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+  # I log sono scritti in UART in modo BLOCCANTE: a 115200 baud una riga da
+  # ~100 caratteri costa ~9ms nel main loop. Ogni scatto di ghiera generava
+  # una riga "Sending state" del sensore encoder: girando veloce il loop
+  # passava piu' tempo a loggare che a disegnare -> ghiera che lagga.
+  # Qui si zittiscono solo i tag "caldi", il resto resta a DEBUG.
+  logs:
+    sensor: WARN
+    binary_sensor: WARN
+    rotary_encoder: WARN
+    # ERROR (non WARN): a luce spenta HA manda brightness=None e il sensore
+    # logga "Can't convert 'None' to number!" a ogni update. E' un
+    # comportamento atteso (il filtro isnan lo scarta gia'), quindi si
+    # silenzia il warning.
+    homeassistant.sensor: ERROR
+    homeassistant.binary_sensor: WARN
+    script: WARN
+    lvgl: WARN
+    api.service: WARN
+
+api:
+  encryption:
+    key: !secret portable_knob_api_key
+
+ota:
+  - platform: esphome
+    password: !secret portable_knob_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Risparmio energetico WiFi: il modem dorme tra un beacon e l'altro.
+  # LIGHT costa qualche decina di ms di latenza sui comandi da HA ma
+  # risparmia ~20-30mA. Se la latenza non ti disturba prova HIGH
+  # (risparmia di piu', latenza piu' visibile).
+  power_save_mode: LIGHT
+  # Home Assistant gira in WSL2, dove il multicast (mDNS/zeroconf) non passa
+  # attraverso il NAT: se il DHCP cambia l'IP del knob, HA NON riesce piu' a
+  # riscoprirlo e il device resta "unavailable" per sempre. Con un IP fisso il
+  # problema non si ripresenta.
+  # PRIMA DI ABILITARLO: verifica gateway/subnet reali e che l'IP scelto sia
+  # fuori dal pool DHCP (o riservalo sul router), altrimenti il device diventa
+  # irraggiungibile via rete e serve un reflash via USB.
+  manual_ip:
+    static_ip: 192.168.1.104
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+    dns1: 192.168.1.1
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# =====================================================
+# Deep sleep
+# =====================================================
+# Nessun run_duration/sleep_duration: NON entra mai in sleep da solo,
+# solo quando viene chiamato deep_sleep.enter (inattivita' o batteria
+# scarica). In sleep l'ESP32 consuma ~10uA; restano il quiescente
+# dell'MT3608 e il partitore (~1-2mA totali): settimane, non ore.
+# In HA il device risultera' "unavailable" mentre dorme: e' normale.
+deep_sleep:
+  id: ds
+  wakeup_pin:
+    number: GPIO5          # INT del touch CST816: tocca lo schermo per svegliare
+    # NIENTE inverted: su questa scheda l'INT riposa BASSO e pulsa ALTO
+    # al tocco. Con inverted:true il pin risultava "sempre attivo":
+    # con IGNORE dormiva e si risvegliava subito, con KEEP_AWAKE non
+    # dormiva mai (restava online in HA a pieno consumo).
+    allow_other_uses: true
+  # Default = IGNORE: entrerebbe in sleep anche con l'INT gia' attivo,
+  # risvegliandosi all'istante (= riavvio immediato). KEEP_AWAKE rimanda
+  # lo sleep finche' il pin non torna a riposo.
+  wakeup_pin_mode: KEEP_AWAKE
+
+# Polling periodico
+interval:
+  # Rendering coalescato: al massimo un redraw ogni 40ms, e solo se
+  # qualcosa e' cambiato. Evita che una rotazione veloce accodi decine
+  # di redraw completi nel main loop.
+  - interval: 40ms
+    then:
+      - if:
+          condition: { lambda: 'return id(ui_dirty);' }
+          then:
+            - lambda: 'id(ui_dirty) = false;'
+            - script.execute: render_ui
+
+  # Refresh WOL status sulla pagina WOL (rete di sicurezza)
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(view) == 0 && id(main_idx) == 2;'
+          then:
+            - script.execute: refresh_ui
+  # Standby a due stadi:
+  #  1) dopo ${standby_ms} di inattivita' -> backlight off (risveglio istantaneo)
+  #  2) dopo ${deepsleep_ms} -> deep sleep vero (risveglio col tocco, ~3-5s di boot)
+  - interval: 2s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(screen_on) && (millis() - id(last_interaction_ms)) > ${standby_ms};
+          then:
+            - script.execute: sleep_screen
+      - if:
+          condition:
+            lambda: |-
+              return (millis() - id(last_interaction_ms)) > ${deepsleep_ms};
+          then:
+            - script.execute: enter_deep_sleep
+
+# =====================================================
+# Hardware enables
+# =====================================================
+switch:
+  - platform: gpio
+    pin: GPIO1
+    id: lcd_pwr_en1
+    restore_mode: ALWAYS_ON
+    internal: true
+  - platform: gpio
+    pin: GPIO2
+    id: lcd_pwr_en2
+    restore_mode: ALWAYS_ON
+    internal: true
+  - platform: gpio
+    pin: GPIO40
+    id: power_led
+    restore_mode: ALWAYS_ON
+    internal: true
+
+# =====================================================
+# Display GC9A01A
+# =====================================================
+spi:
+  - id: lcd_spi
+    mosi_pin: GPIO11
+    clk_pin: GPIO10
+    interface: hardware
+
+output:
+  - platform: ledc
+    pin: GPIO46
+    id: backlight_pwm
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    id: backlight
+    name: "Knob Backlight"
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0s
+
+display:
+  - platform: mipi_spi
+    id: main_lcd
+    model: GC9A01A
+    spi_id: lcd_spi
+    cs_pin: GPIO9
+    dc_pin: GPIO3
+    reset_pin: GPIO14
+    data_rate: 80MHz
+    invert_colors: true
+    auto_clear_enabled: false
+    update_interval: never
+    rotation: 0
+
+# =====================================================
+# Touch CST816
+# =====================================================
+i2c:
+  - id: bus_touch
+    sda: GPIO6
+    scl: GPIO7
+    frequency: 400kHz
+    scan: false
+
+touchscreen:
+  - platform: cst816
+    id: knob_touch
+    i2c_id: bus_touch
+    address: 0x15
+    # GPIO5 e' condiviso con il wakeup_pin del deep_sleep (vedi sopra)
+    interrupt_pin:
+      number: GPIO5
+      allow_other_uses: true
+    reset_pin: GPIO13
+    transform:
+      mirror_x: false
+      mirror_y: true
+      swap_xy: true
+    on_touch:
+      - lambda: 'id(last_interaction_ms) = millis();'
+      - if:
+          condition:
+            lambda: 'return !id(screen_on);'
+          then:
+            - script.execute: wake_screen
+
+# =====================================================
+# Globals (state machine + cached HA states)
+# =====================================================
+globals:
+  # view: 0=main 1=lights_menu 2=light_detail 3=rele_menu 4=rele_detail
+  - id: view
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # snapshot del view all'inizio del press (per evitare cascate)
+  - id: press_view_snap
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # main menu index: 0=Lights 1=Rele 2=WOL
+  - id: main_idx
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # lights submenu index: 0=Desk 1=Camera 2=Letto 3=Back
+  - id: lights_idx
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # rele submenu index: 0=3D 1=Camera 2=Computer 3=Back
+  - id: rele_idx
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # quale luce/rele e' nel dettaglio (0..2)
+  - id: cur_light
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: cur_rele
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Accumulatore per rendere la ghiera meno sensibile.
+  # Servono ${rot_divisor} scatti per produrre 1 evento effettivo
+  # (si regola dalla substitution "rot_divisor" in cima al file).
+  - id: rot_accum
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # === Rendering coalescato ===
+  # refresh_ui non ridisegna piu' direttamente: alza solo questo flag.
+  # Un interval a 40ms fa il rendering vero al massimo 25 volte/secondo,
+  # cosi' N eventi ravvicinati (ghiera + echi di HA) costano 1 solo redraw.
+  - id: ui_dirty
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  # Timestamp dell'ultima modifica locale di luminosita', per ignorare
+  # l'eco di ritorno da HA che altrimenti sovrascrive il valore appena
+  # impostato e fa "rimbalzare" l'arco.
+  - id: local_edit_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Ultimo invio effettivo di luminosita' verso HA (throttle "leading edge":
+  # mentre giri la luce segue in tempo reale, ma al massimo 1 chiamata ogni
+  # ${bri_push_ms}, invece di una raffica di chiamate API).
+  - id: last_push_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Firma di cio' che e' gia' disegnato sulla pagina dettaglio luce
+  # (luce corrente + on/off + percentuale). Se non cambia, render_ui non
+  # tocca i widget: niente invalidazione LVGL, niente redraw.
+  - id: rend_key
+    type: uint32_t
+    restore_value: false
+    initial_value: '0xFFFFFFFF'
+
+  # Stati cache da HA
+  - id: desk_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: desk_pct
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: camera_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: camera_pct
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: letto_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: letto_pct
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  - id: printer_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: rele_camera_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: computer_on
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  - id: pc_online
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # === Standby ===
+  - id: screen_on
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+  - id: last_interaction_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+# =====================================================
+# Sensors
+# =====================================================
+sensor:
+  - platform: rotary_encoder
+    id: knob_encoder
+    pin_a:
+      number: GPIO45
+      mode: { input: true, pullup: true }
+    pin_b:
+      number: GPIO42
+      mode: { input: true, pullup: true }
+    # resolution: 4 contava ogni fronte della quadratura: un solo scatto
+    # fisico generava 4 eventi (4 script, 4 log, 4 refresh) e con
+    # rot_divisor: 3 gli step non cadevano nemmeno in fase con gli scatti
+    # (a volte 1 scatto = niente, a volte = 2 passi).
+    # Con resolution: 1 si conta un ciclo completo = 1 scatto: 4x eventi in
+    # meno e passo perfettamente allineato al click meccanico.
+    resolution: 1
+    on_clockwise:
+      - script.execute:
+          id: knob_rotate
+          delta: 1
+    on_anticlockwise:
+      - script.execute:
+          id: knob_rotate
+          delta: -1
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    update_interval: 30s
+
+  # Luminosita' da HA per ogni luce (0-255 -> 0-100)
+  - platform: homeassistant
+    id: ha_desk_brightness
+    entity_id: light.desk_led
+    attribute: brightness
+    on_value:
+      - lambda: |-
+          // Eco di ritorno da HA: mentre l'utente gira la ghiera su questa
+          // luce il valore locale vince, altrimenti l'arco rimbalza.
+          if (id(view) == 2 && id(cur_light) == 0 &&
+              (millis() - id(local_edit_ms)) < ${ha_echo_guard_ms}) return;
+          if (!isnan(x) && x > 0) {
+            int pct = (int)((x * 100.0f / 255.0f) + 0.5f);
+            if (pct < 1) pct = 1;
+            if (pct > 100) pct = 100;
+            id(desk_pct) = pct;
+          }
+      - script.execute: refresh_ui
+
+  - platform: homeassistant
+    id: ha_camera_brightness
+    entity_id: light.camera
+    attribute: brightness
+    on_value:
+      - lambda: |-
+          if (id(view) == 2 && id(cur_light) == 1 &&
+              (millis() - id(local_edit_ms)) < ${ha_echo_guard_ms}) return;
+          if (!isnan(x) && x > 0) {
+            int pct = (int)((x * 100.0f / 255.0f) + 0.5f);
+            if (pct < 1) pct = 1;
+            if (pct > 100) pct = 100;
+            id(camera_pct) = pct;
+          }
+      - script.execute: refresh_ui
+
+  - platform: homeassistant
+    id: ha_letto_brightness
+    entity_id: light.letto
+    attribute: brightness
+    on_value:
+      - lambda: |-
+          if (id(view) == 2 && id(cur_light) == 2 &&
+              (millis() - id(local_edit_ms)) < ${ha_echo_guard_ms}) return;
+          if (!isnan(x) && x > 0) {
+            int pct = (int)((x * 100.0f / 255.0f) + 0.5f);
+            if (pct < 1) pct = 1;
+            if (pct > 100) pct = 100;
+            id(letto_pct) = pct;
+          }
+      - script.execute: refresh_ui
+
+# =====================================================
+# Binary sensors (pulsante encoder + stati HA)
+# =====================================================
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO41
+      mode: { input: true, pullup: true }
+      inverted: true
+    id: knob_btn
+    filters:
+      - delayed_on: 15ms
+      - delayed_off: 15ms
+    on_multi_click:
+      # Doppio click rapido -> torna indietro
+      - timing:
+          - ON for at most 0.5s
+          - OFF for at most 0.4s
+          - ON for at most 0.5s
+          - OFF for at least 0.2s
+        then:
+          - script.execute: knob_double_press
+      # Singolo click (ritardato di ~400ms per disambiguare)
+      - timing:
+          - ON for at most 1s
+          - OFF for at least 0.4s
+        then:
+          - script.execute: knob_press
+
+  # Stato on/off luci.
+  # NIENTE anti-eco qui (a differenza della brightness): l'on/off non
+  # "rimbalza" durante le dissolvenze, e scartare l'evento e' peggio —
+  # HA non lo rimanda, e la UI restava congelata su ON/100% dopo uno
+  # spegnimento fatto dentro la finestra di guardia.
+  - platform: homeassistant
+    id: ha_desk_state
+    entity_id: light.desk_led
+    on_state:
+      - lambda: 'id(desk_on) = x;'
+      - script.execute: refresh_ui
+  - platform: homeassistant
+    id: ha_camera_state
+    entity_id: light.camera
+    on_state:
+      - lambda: 'id(camera_on) = x;'
+      - script.execute: refresh_ui
+  - platform: homeassistant
+    id: ha_letto_state
+    entity_id: light.letto
+    on_state:
+      - lambda: 'id(letto_on) = x;'
+      - script.execute: refresh_ui
+
+  # Stato on/off rele
+  - platform: homeassistant
+    id: ha_printer_state
+    entity_id: switch.rele_3d_printer
+    on_state:
+      - lambda: 'id(printer_on) = x;'
+      - script.execute: refresh_ui
+  - platform: homeassistant
+    id: ha_rele_camera_state
+    entity_id: switch.rele_camera_switch_0
+    on_state:
+      - lambda: 'id(rele_camera_on) = x;'
+      - script.execute: refresh_ui
+  - platform: homeassistant
+    id: ha_computer_state
+    entity_id: switch.rele_pc_switch_0
+    on_state:
+      - lambda: 'id(computer_on) = x;'
+      - script.execute: refresh_ui
+
+  # PC ping per WOL status
+  - platform: homeassistant
+    id: ha_pc_online
+    entity_id: binary_sensor.192_168_1_10
+    on_state:
+      - lambda: 'id(pc_online) = x;'
+      - script.execute: refresh_ui
+
+# =====================================================
+# Scripts
+# =====================================================
+script:
+  # ----------------------------------------------------
+  # Rotazione encoder: dispatch per view
+  # ----------------------------------------------------
+  - id: knob_rotate
+    mode: queued
+    parameters:
+      delta: int
+    then:
+      - lambda: 'id(last_interaction_ms) = millis();'
+      - if:
+          condition: { lambda: 'return !id(screen_on);' }
+          then:
+            - script.execute: wake_screen
+          else:
+            - lambda: 'id(rot_accum) += delta;'
+            - if:
+                condition:
+                  lambda: 'return id(rot_accum) >= ${rot_divisor} || id(rot_accum) <= -${rot_divisor};'
+                then:
+                  - lambda: |-
+                      int eff = id(rot_accum) / ${rot_divisor};
+                      id(rot_accum) -= eff * ${rot_divisor};
+                      int v = id(view);
+                      if (v == 0) {
+                        int n = id(main_idx) + eff;
+                        while (n < 0) n += 3;
+                        id(main_idx) = n % 3;
+                      } else if (v == 1) {
+                        int n = id(lights_idx) + eff;
+                        while (n < 0) n += 3;
+                        id(lights_idx) = n % 3;
+                      } else if (v == 2) {
+                        bool on = false; int cur = 0;
+                        switch (id(cur_light)) {
+                          case 0: cur = id(desk_pct);   on = id(desk_on);   break;
+                          case 1: cur = id(camera_pct); on = id(camera_on); break;
+                          case 2: cur = id(letto_pct);  on = id(letto_on);  break;
+                        }
+                        int start = on ? cur : 0;
+                        int newv = start + eff * ${bri_step};
+                        if (newv < 0) newv = 0;
+                        if (newv > 100) newv = 100;
+                        switch (id(cur_light)) {
+                          case 0: id(desk_pct)   = newv; id(desk_on)   = (newv > 0); break;
+                          case 1: id(camera_pct) = newv; id(camera_on) = (newv > 0); break;
+                          case 2: id(letto_pct)  = newv; id(letto_on)  = (newv > 0); break;
+                        }
+                        // Da qui in avanti il valore locale e' la verita':
+                        // ignora l'eco di HA finche' l'utente sta girando.
+                        id(local_edit_ms) = millis();
+                      } else if (v == 3) {
+                        int n = id(rele_idx) + eff;
+                        while (n < 0) n += 3;
+                        id(rele_idx) = n % 3;
+                      }
+                  - script.execute: refresh_ui
+                  - if:
+                      condition:
+                        lambda: 'return id(view) == 2;'
+                      then:
+                        # Coda: invio finale ~${bri_push_ms} dopo l'ultimo scatto.
+                        - script.execute: push_light_brightness
+                        # Testa: primo invio subito, poi al massimo uno ogni
+                        # ${bri_push_ms} mentre l'utente continua a girare.
+                        - if:
+                            condition:
+                              lambda: 'return (millis() - id(last_push_ms)) >= ${bri_push_ms};'
+                            then:
+                              - script.execute: send_light_now
+
+  # ----------------------------------------------------
+  # Pressione encoder: dispatch per view+selezione
+  # ----------------------------------------------------
+  - id: knob_press
+    mode: queued
+    then:
+      - lambda: 'id(last_interaction_ms) = millis();'
+      - if:
+          condition: { lambda: 'return !id(screen_on);' }
+          then:
+            # Schermo era spento: solo wake, niente azione
+            - script.execute: wake_screen
+          else:
+            - lambda: 'id(press_view_snap) = id(view);'
+
+            # --- MAIN menu ---
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 0 && id(main_idx) == 0;' }
+                then:
+                  - lambda: 'id(view) = 1; id(lights_idx) = 0;'
+                  - lvgl.page.show: pg_lights
+                  - script.execute: refresh_ui
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 0 && id(main_idx) == 1;' }
+                then:
+                  - lambda: 'id(view) = 3; id(rele_idx) = 0;'
+                  - lvgl.page.show: pg_rele
+                  - script.execute: refresh_ui
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 0 && id(main_idx) == 2;' }
+                then:
+                  - homeassistant.action:
+                      action: button.press
+                      data:
+                        entity_id: button.wake_on_lan_c8_7f_54_6c_e9_61
+
+            # --- LIGHTS submenu (3 items, no Back) ---
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 1;' }
+                then:
+                  - lambda: |-
+                      id(cur_light) = id(lights_idx);
+                      id(view) = 2;
+                  - lvgl.page.show: pg_light_detail
+                  - script.execute: refresh_ui
+
+            # --- LIGHT detail: toggle ---
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 2;' }
+                then:
+                  - script.execute: toggle_current_light
+
+            # --- RELE submenu (3 items, no Back) ---
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 3;' }
+                then:
+                  - lambda: |-
+                      id(cur_rele) = id(rele_idx);
+                      id(view) = 4;
+                  - lvgl.page.show: pg_rele_detail
+                  - script.execute: refresh_ui
+
+            # --- RELE detail: toggle ---
+            - if:
+                condition: { lambda: 'return id(press_view_snap) == 4;' }
+                then:
+                  - script.execute: toggle_current_rele
+
+  # ----------------------------------------------------
+  # Azioni HA
+  # ----------------------------------------------------
+  # Pressione sulla pagina luce:
+  #  - luce accesa  -> spegne
+  #  - luce spenta  -> accende SEMPRE a 100% (non all'ultimo valore,
+  #    che HA ripristinerebbe da solo con light.toggle)
+  # Lo stato locale viene aggiornato subito (UI reattiva) e si riarma
+  # la guardia anti-eco cosi' la dissolvenza di HA non fa rimbalzare l'arco.
+  - id: toggle_current_light
+    then:
+      - if:
+          condition: { lambda: 'return id(cur_light) == 0;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(desk_on);' }
+                then:
+                  - lambda: |-
+                      id(desk_on) = false;
+                      id(local_edit_ms) = millis();
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data: { entity_id: light.desk_led }
+                else:
+                  - lambda: |-
+                      id(desk_on) = true;
+                      id(desk_pct) = 100;
+                      id(local_edit_ms) = millis();
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: light.desk_led
+                        brightness_pct: '100'
+            - script.execute: refresh_ui
+      - if:
+          condition: { lambda: 'return id(cur_light) == 1;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(camera_on);' }
+                then:
+                  - lambda: |-
+                      id(camera_on) = false;
+                      id(local_edit_ms) = millis();
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data: { entity_id: light.camera }
+                else:
+                  - lambda: |-
+                      id(camera_on) = true;
+                      id(camera_pct) = 100;
+                      id(local_edit_ms) = millis();
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: light.camera
+                        brightness_pct: '100'
+            - script.execute: refresh_ui
+      - if:
+          condition: { lambda: 'return id(cur_light) == 2;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(letto_on);' }
+                then:
+                  - lambda: |-
+                      id(letto_on) = false;
+                      id(local_edit_ms) = millis();
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data: { entity_id: light.letto }
+                else:
+                  - lambda: |-
+                      id(letto_on) = true;
+                      id(letto_pct) = 100;
+                      id(local_edit_ms) = millis();
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: light.letto
+                        brightness_pct: '100'
+            - script.execute: refresh_ui
+
+  - id: toggle_current_rele
+    then:
+      - if:
+          condition: { lambda: 'return id(cur_rele) == 0;' }
+          then:
+            - homeassistant.action:
+                action: switch.toggle
+                data: { entity_id: switch.rele_3d_printer }
+      - if:
+          condition: { lambda: 'return id(cur_rele) == 1;' }
+          then:
+            - homeassistant.action:
+                action: switch.toggle
+                data: { entity_id: switch.rele_camera_switch_0 }
+      - if:
+          condition: { lambda: 'return id(cur_rele) == 2;' }
+          then:
+            - homeassistant.action:
+                action: switch.toggle
+                data: { entity_id: switch.rele_pc_switch_0 }
+
+  # ----------------------------------------------------
+  # Standby: wake / sleep dello schermo (backlight)
+  # ----------------------------------------------------
+  - id: wake_screen
+    then:
+      - lambda: |-
+          id(screen_on) = true;
+          id(last_interaction_ms) = millis();
+          id(rot_accum) = 0;
+      - light.turn_on:
+          id: backlight
+          brightness: 100%
+          transition_length: 150ms
+
+  - id: sleep_screen
+    then:
+      - lambda: |-
+          id(screen_on) = false;
+          id(rot_accum) = 0;
+      - light.turn_off:
+          id: backlight
+          transition_length: 400ms
+
+  # Deep sleep vero: chiamato dopo ${deepsleep_ms} di inattivita'.
+  # Si risveglia SOLO col tocco dello schermo (GPIO5); al risveglio
+  # riavvia e riconnette in ~3-5s.
+  # NB: senza il sensore batteria non c'e' cutoff software di scarica:
+  # l'unica protezione contro la sovra-scarica e' il deep sleep stesso
+  # (e non lasciare il knob fermo scarico per settimane).
+  - id: enter_deep_sleep
+    mode: single
+    then:
+      - light.turn_off:
+          id: backlight
+          transition_length: 0s
+      - switch.turn_off: power_led
+      # VARIANTE DI TEST: rail LCD spenti anche loro durante lo sleep.
+      # In sleep si misuravano ~90mA; se il touch (CST816) e' alimentato
+      # dall'LDO 3.3V e non da questi rail, si scende parecchio e il tocco
+      # sveglia ancora. Se invece dopo il flash il tocco NON risveglia piu'
+      # il knob, il touch e' sotto questi rail: ripristina i due
+      # switch.turn_off qui sotto a stato acceso (versione precedente).
+      # Nel frattempo si riaccende staccando/riattaccando la batteria.
+      - switch.turn_off: lcd_pwr_en1
+      - switch.turn_off: lcd_pwr_en2
+      - delay: 100ms
+      # In deep sleep i pad DIGITALI (GPIO >= 22) smettono di essere
+      # pilotati: GPIO46 (backlight) flottava e lo schermo si RIACCENDEVA
+      # da solo. Si congela lo stato attuale dei pin critici con
+      # gpio_hold_en; per i pad digitali (40, 46) serve anche
+      # gpio_deep_sleep_hold_en(). Gli hold vengono rilasciati in on_boot.
+      #  - GPIO1/2 BASSI -> rail LCD spenti durante lo sleep (test)
+      #  - GPIO46 basso  -> backlight spento durante lo sleep
+      #  - GPIO40 basso  -> power LED spento durante lo sleep
+      #  - GPIO13 ALTO   -> reset del CST816 tenuto alto, cosi' se il touch
+      #                     e' ancora alimentato puo' svegliare via GPIO5
+      - lambda: |-
+          gpio_hold_en(GPIO_NUM_1);
+          gpio_hold_en(GPIO_NUM_2);
+          gpio_hold_en(GPIO_NUM_13);
+          gpio_hold_en(GPIO_NUM_40);
+          gpio_hold_en(GPIO_NUM_46);
+          gpio_deep_sleep_hold_en();
+      - deep_sleep.enter: ds
+
+  # ----------------------------------------------------
+  # Doppio click ghiera = torna indietro di un livello
+  # ----------------------------------------------------
+  - id: knob_double_press
+    then:
+      - lambda: 'id(last_interaction_ms) = millis();'
+      - if:
+          condition: { lambda: 'return !id(screen_on);' }
+          then:
+            - script.execute: wake_screen
+          else:
+            - lambda: |-
+                int v = id(view);
+                if (v == 4) id(view) = 3;
+                else if (v == 3) id(view) = 0;
+                else if (v == 2) id(view) = 1;
+                else if (v == 1) id(view) = 0;
+            - if:
+                condition: { lambda: 'return id(view) == 0;' }
+                then:
+                  - lvgl.page.show: pg_main
+            - if:
+                condition: { lambda: 'return id(view) == 1;' }
+                then:
+                  - lvgl.page.show: pg_lights
+            - if:
+                condition: { lambda: 'return id(view) == 3;' }
+                then:
+                  - lvgl.page.show: pg_rele
+            - script.execute: refresh_ui
+
+  # Invio finale (coda del throttle): parte ${bri_push_ms} dopo l'ULTIMO
+  # scatto, cosi' il valore definitivo arriva sempre a HA anche se l'ultimo
+  # movimento e' caduto dentro la finestra di throttle.
+  - id: push_light_brightness
+    mode: restart
+    then:
+      - delay: ${bri_push_ms}ms
+      - script.execute: send_light_now
+
+  # Invio immediato della luminosita' della luce corrente.
+  - id: send_light_now
+    mode: single
+    then:
+      # Riarma la finestra di guardia: l'eco di HA per QUESTA chiamata
+      # arrivera' fra qualche centinaio di ms e va ignorato.
+      - lambda: |-
+          id(local_edit_ms) = millis();
+          id(last_push_ms)  = millis();
+      - if:
+          condition: { lambda: 'return id(cur_light) == 0;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(desk_pct) <= 0;' }
+                then:
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data: { entity_id: light.desk_led }
+                else:
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: light.desk_led
+                        brightness_pct: !lambda 'return std::to_string(id(desk_pct));'
+      - if:
+          condition: { lambda: 'return id(cur_light) == 1;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(camera_pct) <= 0;' }
+                then:
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data: { entity_id: light.camera }
+                else:
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: light.camera
+                        brightness_pct: !lambda 'return std::to_string(id(camera_pct));'
+      - if:
+          condition: { lambda: 'return id(cur_light) == 2;' }
+          then:
+            - if:
+                condition: { lambda: 'return id(letto_pct) <= 0;' }
+                then:
+                  - homeassistant.action:
+                      action: light.turn_off
+                      data: { entity_id: light.letto }
+                else:
+                  - homeassistant.action:
+                      action: light.turn_on
+                      data:
+                        entity_id: light.letto
+                        brightness_pct: !lambda 'return std::to_string(id(letto_pct));'
+
+  # ----------------------------------------------------
+  # Refresh UI: NON ridisegna, marca solo la UI come "sporca".
+  # Il redraw vero lo fa render_ui, chiamato al massimo ogni 40ms
+  # dall'interval in cima al file. Cosi' una raffica di eventi
+  # (scatti di ghiera + echi di stato da HA) collassa in un solo redraw.
+  # ----------------------------------------------------
+  - id: refresh_ui
+    mode: single
+    then:
+      - lambda: 'id(ui_dirty) = true;'
+
+  # ----------------------------------------------------
+  # Rendering vero: aggiorna SOLO i widget della pagina visibile.
+  # Prima venivano aggiornati ~30 widget di tutte e 5 le pagine ad ogni
+  # evento: era la causa principale del lag della ghiera.
+  # ----------------------------------------------------
+  - id: render_ui
+    mode: restart
+    then:
+      # --- MAIN page (view 0) ---
+      - if:
+          condition: { lambda: 'return id(view) == 0;' }
+          then:
+            - lvgl.label.update:
+                id: lbl_main_name
+                text: !lambda |-
+                  switch (id(main_idx)) {
+                    case 0: return std::string("Lights");
+                    case 1: return std::string("Rele");
+                    case 2: return std::string("WOL");
+                  }
+                  return std::string("");
+            - lvgl.label.update:
+                id: lbl_main_icon
+                text: !lambda |-
+                  switch (id(main_idx)) {
+                    case 0: return std::string("\xEF\x80\x91");   // U+F011 LV_SYMBOL_POWER
+                    case 1: return std::string("\xEF\x83\xA7");   // U+F0E7 LV_SYMBOL_CHARGE (bolt)
+                    case 2: return std::string("\xEF\x87\xAB");   // U+F1EB LV_SYMBOL_WIFI
+                  }
+                  return std::string("");
+            - lvgl.label.update:
+                id: lbl_main_status
+                text: !lambda |-
+                  if (id(main_idx) == 2) {
+                    bool online = id(ha_pc_online).state;
+                    return std::string(online ? "Status: Connected" : "Status: Disconnected");
+                  }
+                  return std::string("");
+            - lvgl.label.update:
+                id: lbl_main_status
+                text_color: !lambda |-
+                  if (id(main_idx) == 2) {
+                    return lv_color_hex(id(ha_pc_online).state ? 0x4ADE80 : 0xF87171);
+                  }
+                  return lv_color_hex(0x9CA3AF);
+
+      # --- LIGHTS submenu: highlight (view 1) ---
+      - if:
+          condition: { lambda: 'return id(view) == 1;' }
+          then:
+            - lvgl.widget.update:
+                id: btn_l_desk
+                bg_color: !lambda 'return lv_color_hex(id(lights_idx) == 0 ? 0xFFFFFF : 0x4F46E5);'
+            - lvgl.widget.update:
+                id: btn_l_camera
+                bg_color: !lambda 'return lv_color_hex(id(lights_idx) == 1 ? 0xFFFFFF : 0x4F46E5);'
+            - lvgl.widget.update:
+                id: btn_l_letto
+                bg_color: !lambda 'return lv_color_hex(id(lights_idx) == 2 ? 0xFFFFFF : 0x4F46E5);'
+            - lvgl.label.update:
+                id: lbl_l_desk
+                text_color: !lambda 'return lv_color_hex(id(lights_idx) == 0 ? 0x4F46E5 : 0xFFFFFF);'
+            - lvgl.label.update:
+                id: lbl_l_camera
+                text_color: !lambda 'return lv_color_hex(id(lights_idx) == 1 ? 0x4F46E5 : 0xFFFFFF);'
+            - lvgl.label.update:
+                id: lbl_l_letto
+                text_color: !lambda 'return lv_color_hex(id(lights_idx) == 2 ? 0x4F46E5 : 0xFFFFFF);'
+
+      # --- LIGHT detail (view 2) ---
+      # Questa e' la pagina "calda": ci si sta sopra mentre si gira la ghiera.
+      # lv_label_set_text invalida l'area del widget ANCHE se il testo e'
+      # identico, quindi ridisegnare a ogni tick da 40ms costava redraw
+      # inutili. Si ridisegna solo se cambia qualcosa davvero.
+      - if:
+          condition:
+            lambda: |-
+              if (id(view) != 2) return false;
+              int pct = 0; bool on = false;
+              switch (id(cur_light)) {
+                case 0: pct = id(desk_pct);   on = id(desk_on);   break;
+                case 1: pct = id(camera_pct); on = id(camera_on); break;
+                case 2: pct = id(letto_pct);  on = id(letto_on);  break;
+              }
+              if (!on) pct = 0;
+              uint32_t k = ((uint32_t)id(cur_light) << 9) | (on ? 0x100u : 0u) | (uint32_t)pct;
+              if (k == id(rend_key)) return false;
+              id(rend_key) = k;
+              return true;
+          then:
+            - lvgl.label.update:
+                id: lbl_ld_name
+                text: !lambda |-
+                  switch (id(cur_light)) {
+                    case 0: return std::string("Desk");
+                    case 1: return std::string("Camera");
+                    case 2: return std::string("Letto");
+                  }
+                  return std::string("");
+            - lvgl.arc.update:
+                id: arc_light
+                value: !lambda |-
+                  switch (id(cur_light)) {
+                    case 0: return id(desk_on)   ? id(desk_pct)   : 0;
+                    case 1: return id(camera_on) ? id(camera_pct) : 0;
+                    case 2: return id(letto_on)  ? id(letto_pct)  : 0;
+                  }
+                  return 0;
+            - lvgl.label.update:
+                id: lbl_ld_pct
+                text: !lambda |-
+                  int v = 0;
+                  switch (id(cur_light)) {
+                    case 0: v = id(desk_on)   ? id(desk_pct)   : 0; break;
+                    case 1: v = id(camera_on) ? id(camera_pct) : 0; break;
+                    case 2: v = id(letto_on)  ? id(letto_pct)  : 0; break;
+                  }
+                  char b[8]; snprintf(b, sizeof(b), "%d%%", v);
+                  return std::string(b);
+            - lvgl.label.update:
+                id: lbl_ld_state
+                text: !lambda |-
+                  bool on = false;
+                  switch (id(cur_light)) {
+                    case 0: on = id(desk_on);   break;
+                    case 1: on = id(camera_on); break;
+                    case 2: on = id(letto_on);  break;
+                  }
+                  return std::string(on ? "ON" : "OFF");
+
+      # --- RELE submenu: highlight (view 3) ---
+      - if:
+          condition: { lambda: 'return id(view) == 3;' }
+          then:
+            - lvgl.widget.update:
+                id: btn_r_printer
+                bg_color: !lambda 'return lv_color_hex(id(rele_idx) == 0 ? 0xFFFFFF : 0x4F46E5);'
+            - lvgl.widget.update:
+                id: btn_r_camera
+                bg_color: !lambda 'return lv_color_hex(id(rele_idx) == 1 ? 0xFFFFFF : 0x4F46E5);'
+            - lvgl.widget.update:
+                id: btn_r_computer
+                bg_color: !lambda 'return lv_color_hex(id(rele_idx) == 2 ? 0xFFFFFF : 0x4F46E5);'
+            - lvgl.label.update:
+                id: lbl_r_printer
+                text_color: !lambda 'return lv_color_hex(id(rele_idx) == 0 ? 0x4F46E5 : 0xFFFFFF);'
+            - lvgl.label.update:
+                id: lbl_r_camera
+                text_color: !lambda 'return lv_color_hex(id(rele_idx) == 1 ? 0x4F46E5 : 0xFFFFFF);'
+            - lvgl.label.update:
+                id: lbl_r_computer
+                text_color: !lambda 'return lv_color_hex(id(rele_idx) == 2 ? 0x4F46E5 : 0xFFFFFF);'
+
+      # --- RELE detail (view 4) ---
+      - if:
+          condition: { lambda: 'return id(view) == 4;' }
+          then:
+            - lvgl.label.update:
+                id: lbl_rd_name
+                text: !lambda |-
+                  switch (id(cur_rele)) {
+                    case 0: return std::string("3D Printer");
+                    case 1: return std::string("Camera");
+                    case 2: return std::string("Computer");
+                  }
+                  return std::string("");
+            # Icona impostata dinamicamente (stesso pipeline delle icone del main menu)
+            # LV_SYMBOL_POWER = U+F011
+            - lvgl.label.update:
+                id: lbl_rd_icon
+                text: !lambda 'return std::string("\xEF\x80\x91");'
+            - lvgl.label.update:
+                id: lbl_rd_state
+                text: !lambda |-
+                  bool on = false;
+                  switch (id(cur_rele)) {
+                    case 0: on = id(printer_on);     break;
+                    case 1: on = id(rele_camera_on); break;
+                    case 2: on = id(computer_on);    break;
+                  }
+                  return std::string(on ? "ON" : "OFF");
+            - lvgl.label.update:
+                id: lbl_rd_state
+                text_color: !lambda |-
+                  bool on = false;
+                  switch (id(cur_rele)) {
+                    case 0: on = id(printer_on);     break;
+                    case 1: on = id(rele_camera_on); break;
+                    case 2: on = id(computer_on);    break;
+                  }
+                  return lv_color_hex(on ? 0x4ADE80 : 0xF87171);
+
+# =====================================================
+# LVGL UI
+# =====================================================
+lvgl:
+  touchscreens:
+    - touchscreen_id: knob_touch
+  bg_color: 0x111827
+  text_color: 0xFFFFFF
+
+  pages:
+    # ---------- MAIN MENU ----------
+    - id: pg_main
+      bg_color: 0x111827
+      pad_all: 0
+      widgets:
+        - label:
+            id: lbl_main_name
+            align: CENTER
+            y: -55
+            text: "Lights"
+            text_color: 0xFFFFFF
+            text_font: montserrat_28
+        - label:
+            id: lbl_main_icon
+            align: CENTER
+            y: 5
+            text: "\xEF\x80\x91"
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_main_status
+            align: CENTER
+            y: 65
+            text: ""
+            text_color: 0x9CA3AF
+            text_font: montserrat_16
+
+    # ---------- LIGHTS SUBMENU ----------
+    - id: pg_lights
+      bg_color: 0x111827
+      pad_all: 0
+      widgets:
+        - button:
+            id: btn_l_desk
+            x: 70
+            y: 50
+            width: 100
+            height: 35
+            bg_color: 0x4F46E5
+            radius: 12
+            widgets:
+              - label:
+                  id: lbl_l_desk
+                  align: CENTER
+                  text: "Desk"
+                  text_color: 0xFFFFFF
+        - button:
+            id: btn_l_camera
+            x: 70
+            y: 102
+            width: 100
+            height: 35
+            bg_color: 0x4F46E5
+            radius: 12
+            widgets:
+              - label:
+                  id: lbl_l_camera
+                  align: CENTER
+                  text: "Camera"
+                  text_color: 0xFFFFFF
+        - button:
+            id: btn_l_letto
+            x: 70
+            y: 154
+            width: 100
+            height: 35
+            bg_color: 0x4F46E5
+            radius: 12
+            widgets:
+              - label:
+                  id: lbl_l_letto
+                  align: CENTER
+                  text: "Letto"
+                  text_color: 0xFFFFFF
+
+    # ---------- LIGHT DETAIL ----------
+    - id: pg_light_detail
+      bg_color: 0x111827
+      pad_all: 0
+      widgets:
+        - arc:
+            id: arc_light
+            align: CENTER
+            # Nudge opzionale (substitutions arc_dx/arc_dy) per compensare un
+            # vetro tondo non perfettamente allineato al raster 240x240:
+            # LVGL centra il cerchio a x=120,y=120, che e' il centro esatto
+            # del framebuffer, ma su alcuni pannelli il ritaglio circolare e'
+            # spostato di 1-3 px e l'anello sembra fuori centro.
+            x: ${arc_dx}
+            y: ${arc_dy}
+            # DEVE essere quadrato E pari: LVGL centra l'arco a
+            #   center.x = x1 + min(w,h)/2 + pad_left
+            # quindi con w != h il cerchio esce dal centro del box
+            # (210x200 -> centro a x=115 invece di 120).
+            width: 210
+            height: 210
+            pad_all: 0
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 135
+            end_angle: 45
+            arc_color: 0x404040
+            arc_width: 8
+            arc_rounded: true
+            indicator:
+              arc_color: 0x818CF8
+              arc_width: 8
+              # Stessi cap dello sfondo, altrimenti l'inizio dell'indicatore
+              # non combacia con l'inizio dell'anello grigio e sembra sfasato.
+              arc_rounded: true
+            knob:
+              bg_opa: TRANSP
+            adjustable: false
+            clickable: false
+            bg_opa: TRANSP
+        # Blocco di testo simmetrico rispetto al centro dello schermo:
+        # prima nome/percentuale/stato occupavano da -66 a +56, cioe' erano
+        # 5px piu' in alto del centro dell'anello.
+        - label:
+            id: lbl_ld_name
+            align: CENTER
+            y: -58
+            text: "Camera"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+        - label:
+            id: lbl_ld_pct
+            align: CENTER
+            y: 0
+            text: "0%"
+            text_color: 0xFFFFFF
+            text_font: montserrat_34
+        - label:
+            id: lbl_ld_state
+            align: CENTER
+            y: 58
+            text: "OFF"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+
+    # ---------- RELE SUBMENU ----------
+    - id: pg_rele
+      bg_color: 0x111827
+      pad_all: 0
+      widgets:
+        - button:
+            id: btn_r_printer
+            x: 60
+            y: 50
+            width: 120
+            height: 35
+            bg_color: 0x4F46E5
+            radius: 12
+            widgets:
+              - label:
+                  id: lbl_r_printer
+                  align: CENTER
+                  text: "3D Printer"
+                  text_color: 0xFFFFFF
+        - button:
+            id: btn_r_camera
+            x: 60
+            y: 102
+            width: 120
+            height: 35
+            bg_color: 0x4F46E5
+            radius: 12
+            widgets:
+              - label:
+                  id: lbl_r_camera
+                  align: CENTER
+                  text: "Camera"
+                  text_color: 0xFFFFFF
+        - button:
+            id: btn_r_computer
+            x: 60
+            y: 154
+            width: 120
+            height: 35
+            bg_color: 0x4F46E5
+            radius: 12
+            widgets:
+              - label:
+                  id: lbl_r_computer
+                  align: CENTER
+                  text: "Computer"
+                  text_color: 0xFFFFFF
+
+    # ---------- RELE DETAIL ----------
+    - id: pg_rele_detail
+      bg_color: 0x111827
+      pad_all: 0
+      widgets:
+        - label:
+            id: lbl_rd_name
+            align: CENTER
+            y: -55
+            text: "Computer"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+        - label:
+            id: lbl_rd_icon
+            align: CENTER
+            y: 0
+            text: ""
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+        - label:
+            id: lbl_rd_state
+            align: CENTER
+            y: 55
+            text: "OFF"
+            text_color: 0xF87171
+            text_font: montserrat_18
